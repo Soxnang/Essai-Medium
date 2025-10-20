@@ -1,0 +1,238 @@
+// Jenkinsfile - Backend only (Windows compatible)
+pipeline {
+    agent any
+
+    tools {
+        maven "mvn"
+    }
+
+    environment {
+        BACKEND_IMAGE    = 'fatimal23/projet-expenseb'
+        DOCKERHUB_USER   = "fatimal23"
+        BACKEND_TAG      = "1.${BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Checkout du code') {
+            steps {
+                echo '📥 Récupération du code depuis GitHub'
+                checkout scm
+            }
+        }
+
+        stage('Build') {
+            steps {
+                bat 'mvn clean install'
+            }
+        }
+
+        stage('Backend Tests Unitaires') {
+            steps {
+                script {
+                    bat "mvn clean test surefire-report:report"
+                }
+                publishHTML([
+                    reportDir: 'target',
+                    reportFiles: 'surefire-report.html',
+                    reportName: 'Backend Unit Tests',
+                    allowMissing: true,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true
+                ])
+            }
+        }
+
+        stage('Backend Tests Intégration') {
+            steps {
+                script {
+                    bat "mvn verify site -DgenerateReports=true"
+                }
+                publishHTML([
+                    reportDir: 'target',
+                    reportFiles: 'failsafe-report.html',
+                    reportName: 'Backend Integration Tests',
+                    allowMissing: true,
+                    alwaysLinkToLastBuild: true,
+                    keepAll: true
+                ])
+            }
+        }
+
+        stage('Analyse SonarQube Backend') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    bat '''
+                    mvn clean verify sonar:sonar ^
+                    -Dsonar.projectKey=analyse-code-backend ^
+                    -Dsonar.projectName="analyse-code-backend" ^
+                    -Dsonar.host.url=%SONAR_HOST_URL% ^
+                    -Dsonar.token=%SONAR_AUTH_TOKEN%
+                    '''
+                }
+            }
+        }
+
+        // 🔹 OWASP Dependency-Check avec PDF
+        stage('OWASP Dependency-Check Backend') {
+            steps {
+                dir('backend') {
+                    script {
+                        def depCheckHome = tool name: 'dependency-check-12.1.6', type: 'org.jenkinsci.plugins.DependencyCheck.tools.DependencyCheckInstallation'
+
+                        bat """
+                        if not exist reports mkdir reports
+                        "${depCheckHome}\\bin\\dependency-check.bat" ^
+                            --scan . ^
+                            --format HTML ^
+                            --format XML ^
+                            --out reports
+
+                        REM --- Convertir le rapport HTML en PDF ---
+                        if not exist "C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe" (
+                            echo Installation manuelle requise : wkhtmltopdf non trouvé.
+                        ) else (
+                            "C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe" reports\\dependency-check-report.html reports\\dependency-check-report.pdf
+                        )
+                        """
+                    }
+                }
+            }
+            post {
+                always {
+                    dependencyCheckPublisher pattern: 'backend/reports/dependency-check-report.xml'
+                    archiveArtifacts artifacts: 'backend/reports/dependency-check-report.*', fingerprint: true
+
+                    publishHTML([
+                        reportDir: 'backend/reports',
+                        reportFiles: 'dependency-check-report.html',
+                        reportName: 'OWASP Dependency-Check Backend',
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true
+                    ])
+
+                    echo "📄 Rapport PDF disponible dans : backend/reports/dependency-check-report.pdf"
+                }
+            }
+        }
+
+
+        stage('Build Docker Image') {
+            steps {
+                bat """
+                    docker build -t %BACKEND_IMAGE%:%BACKEND_TAG% .
+                """
+            }
+        }
+
+        stage('Push Image') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'toker-dockerhub', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                    bat """
+                        docker login -u %DOCKER_USER% -p %DOCKER_PASS%
+                        docker push %BACKEND_IMAGE%:%BACKEND_TAG%
+                        docker logout
+                    """
+                }
+            }
+        }
+
+        stage('Install Trivy') {
+            steps {
+                bat """
+                    if not exist bin mkdir bin
+                    if not exist bin\\trivy.exe (
+                        powershell -Command "Invoke-WebRequest -Uri https://github.com/aquasecurity/trivy/releases/download/v0.67.0/trivy_0.67.0_Windows-64bit.zip -OutFile trivy.zip"
+                        powershell -Command "Expand-Archive -Force trivy.zip bin"
+                    )
+                """
+                bat "bin\\trivy.exe -v"
+            }
+        }
+
+        // 🔹 Trivy avec conversion PDF
+        
+        stage('Trivy Scan Image') {
+            steps {
+                dir('backend') {
+                    bat """
+                        if not exist trivy-reports mkdir trivy-reports
+
+                        REM --- Scan JSON ---
+                        ..\\bin\\trivy.exe image ^
+                            --timeout 10m ^
+                            --format json ^
+                            -o trivy-reports\\trivy-report-backend.json ^
+                            %BACKEND_IMAGE%:%BACKEND_TAG%
+
+                        REM --- Convertir JSON en HTML ---
+                        ..\\bin\\trivy.exe convert ^
+                            trivy-reports\\trivy-report-backend.json ^
+                            --format template ^
+                            --template "@contrib/html.tpl" ^
+                            --output trivy-reports\\trivy-report-backend.html
+
+                        REM --- Convertir HTML en PDF avec wkhtmltopdf ---
+                        "C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe" ^
+                            trivy-reports\\trivy-report-backend.html ^
+                            trivy-reports\\trivy-report-backend.pdf
+                    """
+                }
+            }
+            post {
+                always {
+                    archiveArtifacts artifacts: 'backend/trivy-reports/trivy-report-backend.*', fingerprint: true
+                    publishHTML(target: [
+                        allowMissing: false,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'backend/trivy-reports',
+                        reportFiles: 'trivy-report-backend.html',
+                        reportName: 'Trivy Scan Report'
+                    ])
+                    echo "📄 Rapport PDF Trivy disponible : backend/trivy-reports/trivy-report-backend.pdf"
+                }
+            }
+        }
+
+        
+        stage('Deploy to Render') {
+            steps {
+                script {
+                    def changedFiles = bat(
+                        script: 'git diff --name-only HEAD HEAD~1',
+                        returnStdout: true
+                    ).trim().split('\r?\n')
+
+                    def backendChanged = changedFiles.any { file ->
+                        file.startsWith("expense-tracker-service/") ||
+                        file == "Dockerfile" ||
+                        file == "Jenkinsfile"
+                    }
+
+                    if (backendChanged) {
+                        echo "🚀 Changes detected in backend. Deploying backend..."
+                        def backendResponse = httpRequest(
+                            url: "${RENDER_BACKEND_DEPLOY_HOOK}",
+                            httpMode: 'POST',
+                            validResponseCodes: '200:299'
+                        )
+                        echo "Render Backend API Response: ${backendResponse.content}"
+                    } else {
+                        echo "ℹ️ No backend changes detected. Skipping deployment."
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo '🎉 Backend build was successful!'
+        }
+        failure {
+            echo '❌ Backend build failed. Check logs for details.'
+        }
+    }
+}
+backend
